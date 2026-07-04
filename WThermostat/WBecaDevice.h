@@ -141,6 +141,25 @@ const static char MQTT_HASS_AUTODISCOVERY_SENSORIP[]         PROGMEM = R"=====(
 }
 )=====";
 
+// Home Assistant MQTT Discovery - Number entity for the temperature calibration offset
+const static char MQTT_HASS_AUTODISCOVERY_NUMBER[]         PROGMEM = R"=====(
+{
+"name":"Temperature Offset",
+"unique_id":"%s",
+"dev":{"ids":["%s"]},
+"~":"%s",
+"cmd_t":"~/cmnd/things/thermostat/properties/temperatureOffset",
+"stat_t":"~/stat/things/thermostat/properties",
+"val_tpl":"{{value_json.temperatureOffset}}",
+"min":-5,
+"max":5,
+"step":0.1,
+"mode":"slider",
+"unit_of_measurement":"°C",
+"icon":"mdi:thermometer-plus"
+}
+)=====";
+
 const static char PAGE_BECA_JS[]           PROGMEM = R"=====(
 TODO
 )=====";
@@ -220,6 +239,8 @@ const char* PROP_SWITCHBACKTOAUTO PROGMEM = "switchBackToAuto";
 const char* TITL_SWITCHBACKTOAUTO PROGMEM = "switch Back from Manual to Auto at next Schedule";
 const char* PROP_FLOORSENSOR PROGMEM = "floorSensor";
 const char* PROP_PRECISION PROGMEM = "precision";
+const char* PROP_TEMPERATUREOFFSET PROGMEM = "temperatureOffset";
+const char* TITL_TEMPERATUREOFFSET PROGMEM = "Temperature Offset";
 const char* PROP_ACTUALTEMPERATURE PROGMEM = "temperature";
 const char* TITL_ACTUALTEMPERATURE PROGMEM = "Actual";
 const char* PROP_TARGETTEMPERATURE PROGMEM = "targetTemperature";
@@ -262,6 +283,8 @@ const char* ID_PAGE_SCHEDULE PROGMEM = "schedules";
 const char* TITLE_PAGE_SCHEDULE PROGMEM = "Configure Schedules";
 const char* ID_PAGE_REINIT PROGMEM = "reinit";
 const char* TITLE_PAGE_REINIT PROGMEM = "Reinit Thermostat";
+const char* ID_PAGE_CALIBRATION PROGMEM = "calibration";
+const char* TITLE_PAGE_CALIBRATION PROGMEM = "Temperature Calibration";
 
 const byte STORED_FLAG_BECA = 0x36;
 const char SCHEDULES_PERIODS[] = "123456";
@@ -353,16 +376,25 @@ public:
 		this->deadzoneTemp->setByte(constrain(this->deadzoneTemp->getByte(), 1, 5));
 
 
-		// some reserved Bytes
-		network->getSettings()->setByte(PROP_BECARES1, 255);
-		network->getSettings()->setByte(PROP_BECARES2, 255);
-		network->getSettings()->setByte(PROP_BECARES3, 255);
-		network->getSettings()->setByte(PROP_BECARES4, 255);
-		network->getSettings()->setByte(PROP_BECARES5, 255);
-		network->getSettings()->setByte(PROP_BECARES6, 255);
-		network->getSettings()->setByte(PROP_BECARES7, 255);
-		network->getSettings()->setByte(PROP_BECARES8, 255);
-		
+		// temperatureOffset (calibration).
+		// Persisted as a DOUBLE (8 bytes) exactly where the 8 formerly-reserved
+		// bytes (PROP_BECARES1..8) lived, so the EEPROM layout stays unchanged and
+		// existing configs keep working. It is both a persisted setting AND a device
+		// property, so MQTT command/state and WebThing/Home Assistant work out of the box.
+		this->lastRawActualTemperature = NAN;
+		this->temperatureOffset = new WProperty(PROP_TEMPERATUREOFFSET, TITL_TEMPERATUREOFFSET, DOUBLE);
+		this->temperatureOffset->setDouble(0.0);
+		// add() assigns the EEPROM address and loads any persisted value
+		network->getSettings()->add(this->temperatureOffset);
+		// sanitize value coming from fresh flash (NaN) or an upgrade over the old 0xFF reserved bytes
+		this->temperatureOffset->setDouble(clampOffset(this->temperatureOffset->getDouble()));
+		this->lastAppliedOffset = this->temperatureOffset->getDouble();
+		this->temperatureOffset->setReadOnly(false);
+		this->temperatureOffset->setVisibility(ALL);
+		this->temperatureOffset->setMqttSendChangedValues(true);
+		this->temperatureOffset->setOnChange(std::bind(&WBecaDevice::onChangeTemperatureOffset, this, std::placeholders::_1));
+		this->addProperty(this->temperatureOffset);
+
 
 		network->log()->trace(F("Beca settings switchBackToAuto (%d)"), ESP.getMaxFreeBlockSize());
 		// switch back property
@@ -618,7 +650,34 @@ public:
 		this->addPage(schedulePage);
 		network->log()->trace(F("Beca settings page schedule done (%d)"), ESP.getMaxFreeBlockSize());
 
-		// Pages reinit		
+		// Page: Temperature Calibration (live, no reboot needed)
+		WPage * calibrationPage=new WPage(ID_PAGE_CALIBRATION, TITLE_PAGE_CALIBRATION);
+		calibrationPage->setPrintPage([this,calibrationPage](AsyncWebServerRequest* request, AsyncResponseStream* page) {
+			this->network->log()->notice(PSTR("Calibration"));
+			char buf[8];
+			dtostrf(this->getTemperatureOffset(), 3, 1, buf);
+			page->printf_P(HTTP_CONFIG_PAGE_BEGIN, ((String)getId()+"_"+calibrationPage->getId()).c_str());
+			page->print(F("<h2>Temperature Calibration</h2>"));
+			page->print(F("<div>Offset added to the measured temperature. The thermostat also heats to the corrected value.<br>"));
+			page->printf(PSTR("<input type='range' min='-5' max='5' step='0.1' name='to' id='to' value='%s' "
+				"oninput=\"document.getElementById('tov').innerText=this.value\"> "
+				"<span id='tov'>%s</span> &deg;C</div>"), buf, buf);
+			page->printf_P(HTTP_CONFIG_SAVE_BUTTON);
+			page->printf_P(HTTP_HOME_BUTTON);
+		});
+		calibrationPage->setSubmittedPage([this,calibrationPage](AsyncWebServerRequest* request, AsyncResponseStream* page) {
+			float off = clampOffset(getValueOrEmpty(request, "to").toFloat());
+			this->network->log()->notice(PSTR("Set temperatureOffset to %s"), String(off).c_str());
+			// setDouble triggers onChangeTemperatureOffset() -> persist + recompute + resend to MCU
+			this->temperatureOffset->setDouble(off);
+			char buf[8];
+			dtostrf(off, 3, 1, buf);
+			page->printf(PSTR("Temperature offset saved: %s &deg;C"), buf);
+			page->print(FPSTR(HTTP_HOME_BUTTON));
+		});
+		this->addPage(calibrationPage);
+
+		// Pages reinit
 		WPage * reinitPage=new WPage(ID_PAGE_REINIT, TITLE_PAGE_REINIT);
 		reinitPage->setPrintPage([this,reinitPage](AsyncWebServerRequest *request, AsyncResponseStream* page) {
 			this->network->log()->notice(PSTR("Reinit"));
@@ -1043,9 +1102,9 @@ public:
 		if (key[2] == 'h') {
 			snprintf(buf, size-1, "%02d:%02d", (int)schedules[startAddr + period * 3 + 1], (int)schedules[startAddr + period * 3 + 0] );
 		} else if (key[2] == 't') {
-			//temperature
+			//temperature (corrected: MCU value + calibration offset)
 			char str_temp[6];
-			double val = (double)(schedules[startAddr + period * 3 + 2]) / 2.0f;
+			double val = (double)(schedules[startAddr + period * 3 + 2]) / getTemperatureFactor() + getTemperatureOffset();
 			dtostrf(val, 4, 1, str_temp);
 			snprintf(buf, size-1, "%s", str_temp );
 		}
@@ -1070,8 +1129,8 @@ public:
 			schedulesChanged = schedulesChanged || (schedules[startAddr + period * 3 + 0] != mm);
 			schedules[startAddr + period * 3 + 0] = mm;
 		} else if (key[2] == 't') {
-			//temperature
-			byte tt = (int) (atof(value) * getTemperatureFactor());
+			//temperature (user value -> MCU value: subtract calibration offset for active compensation)
+			byte tt = (int) ((atof(value) - getTemperatureOffset()) * getTemperatureFactor());
 			schedulesChanged = schedulesChanged || (schedules[startAddr + period * 3 + 2] != tt);
 			schedules[startAddr + period * 3 + 2] = tt;
 		}
@@ -1112,7 +1171,7 @@ public:
     		buffer[2] = 'h';
     		json->propertyString(buffer, timeStr);
     		buffer[2] = 't';
-    		json->propertyDouble(buffer, (double) schedules[startAddr + i * 3 + 2]	/ getTemperatureFactor());
+    		json->propertyDouble(buffer, (double) schedules[startAddr + i * 3 + 2] / getTemperatureFactor() + getTemperatureOffset());
     	}
     	delete[] buffer;
     }
@@ -1418,6 +1477,22 @@ public:
 		}
 		network->publishMqtt(topic.c_str(), response, true);
 		response->flush();
+
+		// Number entity for the temperature calibration offset
+		unique_id = (String)network->getIdx();
+		unique_id.concat(F("_tempoffset"));
+		topic=F("homeassistant/number/");
+		topic.concat(unique_id);
+		topic.concat(F("/config"));
+		if (!removeDiscovery){
+			response->printf_P(MQTT_HASS_AUTODISCOVERY_NUMBER,
+				unique_id.c_str(),
+				network->getMacAddress().c_str(),
+				network->getMqttTopic()
+			);
+		}
+		network->publishMqtt(topic.c_str(), response, true);
+		response->flush();
 		return true;
 	}
 
@@ -1440,6 +1515,63 @@ protected:
 	}
 	float getTemperatureFactor() {
 		return static_cast<float>(1 / this->temperaturePrecision->getDouble());
+	}
+
+	float getTemperatureOffset() {
+		return (this->temperatureOffset != nullptr ? (float) this->temperatureOffset->getDouble() : 0.0f);
+	}
+
+	// clamp calibration offset to the supported range; NaN (fresh/upgraded flash) -> 0
+	float clampOffset(float v) {
+		if (isnan(v)) return 0.0f;
+		if (v < -5.0f) return -5.0f;
+		if (v > 5.0f) return 5.0f;
+		return v;
+	}
+
+	// user target -> compensated MCU setpoint, clamped to a physically valid range
+	// (a large offset must not push the setpoint out of the MCU's accepted band or wrap the byte)
+	float compensatedTargetForMcu(float userTarget) {
+		float t = userTarget - getTemperatureOffset();
+		if (t < 5.0f) t = 5.0f;
+		if (t > 45.0f) t = 45.0f;
+		return t;
+	}
+
+	// Called whenever the calibration offset changes (web UI, MQTT or Home Assistant).
+	// Re-applies compensation to the values the MCU actually controls with.
+	void onChangeTemperatureOffset(WProperty* property) {
+		float newOffset = clampOffset((float) property->getDouble());
+		if (!WProperty::isEqual(newOffset, property->getDouble(), 0.001)) {
+			// value was out of range (e.g. via MQTT); store the clamped value (re-fires this handler)
+			property->setDouble(newOffset);
+			return;
+		}
+		// Cached schedule temps are stored in "MCU domain" (already compensated with the
+		// previous offset). Shift them so the user-facing schedule temperatures stay the same,
+		// then resend to the MCU with the new compensation.
+		int adj = (int) lround((this->lastAppliedOffset - newOffset) * getTemperatureFactor());
+		if ((adj != 0) && receivedSchedules()) {
+			for (int d = 0; d < 3; d++) {
+				int startAddr = (d == 0 ? 0 : (d == 1 ? 18 : 36));
+				for (int p = 0; p < 6; p++) {
+					int idx = startAddr + p * 3 + 2;
+					int v = (int) schedules[idx] + adj;
+					if (v < 0) v = 0;
+					if (v > 255) v = 255;
+					schedules[idx] = (byte) v;
+				}
+			}
+			schedulesToMcu();
+		}
+		this->lastAppliedOffset = newOffset;
+		// resend manual setpoint with the new compensation (targetTemperatureManualMode is user-domain)
+		targetTemperatureManualModeToMcu();
+		// refresh corrected actual temperature display without waiting for the next MCU report
+		if ((this->actualTemperature != nullptr) && (!isnan(this->lastRawActualTemperature))) {
+			this->actualTemperature->setDouble(this->lastRawActualTemperature + newOffset);
+		}
+		updateTargetTemperature();
 	}
 
 private:
@@ -1476,6 +1608,9 @@ private:
 	WProperty *supportingCoolingRelay;
 	WProperty *deadzoneTemp;
 	WProperty *temperaturePrecision;
+	WProperty *temperatureOffset;
+	double lastRawActualTemperature;
+	double lastAppliedOffset;
 	WProperty *switchBackToAuto;
 	WProperty *floorSensor;
     WProperty* ntpServer;
@@ -1620,7 +1755,7 @@ private:
 								//target Temperature for manual mode
 								//e.g. 24.5C: 55 aa 01 07 00 08 02 02 00 04 00 00 00 31
 								//                                    LENGT xx xx xx xx (longer values? (for 0.1?)) 
-								newValue = static_cast<float>(receivedCommand[13] / getTemperatureFactor());
+								newValue = static_cast<float>(receivedCommand[13] / getTemperatureFactor()) + getTemperatureOffset();
 								changed = ((changed) || (newChanged=!WProperty::isEqual(targetTemperatureManualMode, newValue, 0.01)));
 								targetTemperatureManualMode = newValue;
 								if (changed) updateTargetTemperature();
@@ -1634,7 +1769,8 @@ private:
 							if (commandLength == 0x08) {
 								//actual Temperature
 								//e.g. 23C: 55 aa 01 07 00 08 03 02 00 04 00 00 00 2e
-								newValue = static_cast<float>(static_cast<int8_t>(receivedCommand[13]) / getTemperatureFactor());
+								this->lastRawActualTemperature = static_cast<float>(static_cast<int8_t>(receivedCommand[13]) / getTemperatureFactor());
+								newValue = this->lastRawActualTemperature + getTemperatureOffset();
 								changed = ((changed) || (newChanged=!actualTemperature->equalsDouble(newValue)));
 								actualTemperature->setDouble(newValue);
 								logIncomingCommand("actualTemperature_x03", (newChanged ? LOG_LEVEL_TRACE : LOG_LEVEL_VERBOSE));
@@ -1847,13 +1983,13 @@ private:
 			targetTemperature->setSuppressOnChange();
 			if (getThermostatModel() == MODEL_BAC_002_ALW &&
 			 (this->systemMode->equalsString(SYSTEM_MODE_COOL) || this->systemMode->equalsString(SYSTEM_MODE_FAN))){
-				targetTemperature->setDouble(ECOMODETEMP_COOL);
+				targetTemperature->setDouble(ECOMODETEMP_COOL + getTemperatureOffset());
 			} else {
-				targetTemperature->setDouble(ECOMODETEMP);
+				targetTemperature->setDouble(ECOMODETEMP + getTemperatureOffset());
 			}
 			updateRelaySimulation();
 		} else if ((this->currentSchedulePeriod != -1) && (schedulesMode->equalsString(SCHEDULES_MODE_AUTO))) {
-			double temp = (double) schedules[this->currentSchedulePeriod + 2] / getTemperatureFactor();
+			double temp = (double) schedules[this->currentSchedulePeriod + 2] / getTemperatureFactor() + getTemperatureOffset();
 			String p = String(currentSchedulePeriod>=36 ? SCHEDULES_DAYS[2] : (currentSchedulePeriod>=18 ? SCHEDULES_DAYS[1] : SCHEDULES_DAYS[0]));
 			p.concat(SCHEDULES_PERIODS[(this->currentSchedulePeriod %18) /3]);
 			network->log()->notice((String(PSTR("We take temperature from period '%s', Schedule temperature is "))+String(temp)).c_str() , p.c_str());
@@ -1938,7 +2074,8 @@ private:
     	if (!this->receivingDataFromMcu) {
     		network->log()->notice((String(F("Set target Temperature (manual mode) to "))+String(targetTemperatureManualMode)).c_str());
     	    //55 AA 00 06 00 08 02 02 00 04 00 00 00 2C
-			byte dt = (byte) (targetTemperatureManualMode * getTemperatureFactor());
+    	    // active calibration: send compensated setpoint (user target - offset) so the room reaches the corrected target
+			byte dt = (byte) (compensatedTargetForMcu(targetTemperatureManualMode) * getTemperatureFactor());
     	    unsigned char setTemperatureCommand[] = { 0x55, 0xAA, 0x00, 0x06, 0x00, 0x08,
     	    		0x02, 0x02, 0x00, 0x04,
 					0x00, 0x00, 0x00, dt};

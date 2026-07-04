@@ -1,5 +1,18 @@
 # WThermostat - FAS-Fork
 
+> ### 🌡️ What this fork adds: Temperature Calibration (Offset)
+>
+> This fork adds an **active temperature-offset / calibration** feature. If your
+> thermostat's built-in sensor reads a bit too high or too low, you can apply a
+> correction of **−5 … +5 °C** (0.1° steps). It's not just cosmetic: the firmware
+> also compensates the setpoint sent to the internal Tuya MCU, so the thermostat
+> **actually heats to the corrected temperature**, not just displays it.
+>
+> Set the offset from the local web UI (**Temperature Calibration** page), via MQTT,
+> or through the auto-discovered Home Assistant **Temperature Offset** number entity.
+> The value is stored in flash and applied instantly (no reboot). See
+> [CHANGELOG-temperature-offset.md](CHANGELOG-temperature-offset.md) for full details.
+
 [![GitHub version](https://img.shields.io/github/release/fashberg/WThermostatBeca.svg)](https://github.com/fashberg/WThermostatBeca/releases/latest)
 [![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/fashberg/WThermostatBeca?include_prereleases&label=beta)](https://github.com/fashberg/WThermostatBeca/releases)
 [![GitHub download](https://img.shields.io/github/downloads/fashberg/WThermostatBeca/total.svg)](https://github.com/fashberg/WThermostatBeca/releases/latest)
