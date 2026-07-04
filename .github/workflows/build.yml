@@ -7,23 +7,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repository and submodules
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
       with:
         submodules: recursive
     - name: Cache pip
-      uses: actions/cache@v2
+      uses: actions/cache@v4
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pip-
     - name: Cache PlatformIO
-      uses: actions/cache@v2
+      uses: actions/cache@v4
       with:
         path: ~/.platformio
         key: ${{ runner.os }}-${{ hashFiles('**/lockfiles') }}
     - name: Set up Python
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
     - name: Install PlatformIO
       run: |
         python -m pip install --upgrade pip
@@ -57,33 +59,21 @@ jobs:
     - name: GZIP Firmware
       run: gzip -9 "build_output/firmware/wthermostat-${{ env.RELEASE_VERSION }}.bin"
     - name: Publish Firmware
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: wthermostat-${{ env.RELEASE_VERSION }}
         path: |
           build_output/firmware/*.bin.gz
-    - name: Create Release
+    - name: Create Release and upload firmware
       if: startsWith(github.ref, 'refs/tags/v')
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      uses: softprops/action-gh-release@v2
       with:
-        tag_name: ${{ github.ref }}
-        release_name: Release ${{ env.RELEASE_VERSION }}
+        tag_name: ${{ github.ref_name }}
+        name: Release ${{ env.RELEASE_VERSION }}
         body: |
           Changes in this Release
           - First Change
           - Second Change
         draft: true
         prerelease: true
-    - name: upload firmware
-      if: startsWith(github.ref, 'refs/tags/v')
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: "build_output/firmware/wthermostat-${{ env.RELEASE_VERSION }}.bin.gz"
-        asset_name: "wthermostat-${{ env.RELEASE_VERSION }}.bin.gz"
-        asset_content_type: application/gzip
+        files: build_output/firmware/wthermostat-${{ env.RELEASE_VERSION }}.bin.gz
